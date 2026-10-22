@@ -1,0 +1,1 @@
+ALTER TABLE "audit_logs" DROP CONSTRAINT "audit_logs_document_id_organization_id_documents_id_organization_id_fk";
