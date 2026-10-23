@@ -7,11 +7,13 @@ import { AppError } from "@/lib/errors";
 
 export const ANALYSIS_QUEUE = "document-analysis";
 export const ANALYSIS_RETRY_LIMIT = 3;
-export const ANALYSIS_QUEUE_OPTIONS = {
-  policy: "exclusive", retryLimit: ANALYSIS_RETRY_LIMIT, retryDelay: 30,
+/** pg-boss rejects `policy` in updateQueue, even unchanged, so it is applied only at creation. */
+const ANALYSIS_QUEUE_SETTINGS = {
+  retryLimit: ANALYSIS_RETRY_LIMIT, retryDelay: 30,
   retryBackoff: true, retryDelayMax: 300, heartbeatSeconds: 60,
   expireInSeconds: 900, retentionSeconds: 604800, deleteAfterSeconds: 604800,
 } as const;
+export const ANALYSIS_QUEUE_OPTIONS = { policy: "exclusive", ...ANALYSIS_QUEUE_SETTINGS } as const;
 export interface AnalysisJobData { organizationId: string; documentId: string; processingJobId: string; processingVersion: number; requestedBy: string }
 
 let activeQueue: Promise<PgBoss> | undefined;
@@ -23,7 +25,7 @@ function createQueue(options: { worker?: boolean; migrate?: boolean } = {}) {
 }
 export async function initializeJobQueue(): Promise<void> {
   const boss = createQueue({ migrate: true });
-  try { await boss.start(); await boss.createQueue(ANALYSIS_QUEUE, ANALYSIS_QUEUE_OPTIONS); await boss.updateQueue(ANALYSIS_QUEUE, ANALYSIS_QUEUE_OPTIONS); }
+  try { await boss.start(); await boss.createQueue(ANALYSIS_QUEUE, ANALYSIS_QUEUE_OPTIONS); await boss.updateQueue(ANALYSIS_QUEUE, ANALYSIS_QUEUE_SETTINGS); }
   finally { await boss.stop({ graceful: true, timeout: 10000 }); }
 }
 export function getJobQueue(options: { worker?: boolean } = {}): Promise<PgBoss> {
