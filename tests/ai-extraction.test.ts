@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { emptyModelExtraction, flattenEvidence, modelExtractionSchema, type ModelExtraction } from "../src/lib/ai/extraction-schema";
 import { MistralProcurementExtractor, validateExtraction } from "../src/lib/ai/procurement-extractor";
-import type { OCRDocument } from "../src/lib/ai/types";
+import { AIProcessingError, type OCRDocument } from "../src/lib/ai/types";
 
 const documentId = "fdc45a27-8774-478d-8b41-3484674dd67b";
 const field = (value: string | null = null, quote: string | null = value, page: number | null = value === null ? null : 1) => ({ value, originalText: quote, pageNumber: page, status: value === null ? "missing" as const : "extracted" as const });
@@ -141,6 +141,38 @@ describe("Industrial extraction validation and source evidence", () => {
     expect(transport.mock.calls[0][0].maxTokens).toBe(65_536);
     expect(result.data.products[119].description).toMatchObject({ value: "Part-12-9", pageNumber: 12 });
     expect(result.data.products.every(item => item.unitPrice.value === "1.25")).toBe(true);
+  });
+  it("extracts page ranges concurrently, in page order, within the concurrency limit", async () => {
+    const pages = Array.from({ length: 20 }, (_, index) => ({ pageNumber: index + 1, markdown: `Part-${index + 1}` }));
+    let inFlight = 0;
+    let peak = 0;
+    const transport = vi.fn(async (request) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      const requested = JSON.parse(request.messages[1].content).untrustedDocumentPages as typeof pages;
+      // Later ranges finish first, so ordering cannot come from completion order.
+      await new Promise(resolve => setTimeout(resolve, 40 - requested[0]!.pageNumber));
+      inFlight--;
+      const raw = emptyModelExtraction();
+      raw.products = requested.map(page => product({ description: field(page.markdown, page.markdown, page.pageNumber) }));
+      return { choices: [{ finishReason: "stop", message: { content: JSON.stringify(raw) } }] };
+    });
+    const result = await new MistralProcurementExtractor({ transport, concurrency: 3 }).extract({ ...ocr(""), pages });
+    expect(transport).toHaveBeenCalledTimes(5);
+    expect(peak).toBe(3);
+    expect(result.data.products.map(item => item.description.value)).toEqual(pages.map(page => page.markdown));
+  });
+  it("aborts the remaining page ranges when one fails", async () => {
+    const pages = Array.from({ length: 12 }, (_, index) => ({ pageNumber: index + 1, markdown: `Part-${index + 1}` }));
+    const aborted: number[] = [];
+    const transport = vi.fn((request, options?: { signal?: AbortSignal }) => {
+      const first = (JSON.parse(request.messages[1].content).untrustedDocumentPages as typeof pages)[0]!.pageNumber;
+      if (first === 1) return Promise.reject(new AIProcessingError("EXTRACTION_INVALID_JSON", "invalid", true));
+      return new Promise((_, reject) => options?.signal?.addEventListener("abort", () => { aborted.push(first); reject(options.signal!.reason); }));
+    });
+    await expect(new MistralProcurementExtractor({ transport, concurrency: 3 }).extract({ ...ocr(""), pages })).rejects.toMatchObject({ code: "EXTRACTION_INVALID_JSON" });
+    expect(transport).toHaveBeenCalledTimes(3);
+    expect(aborted.sort((a, b) => a - b)).toEqual([5, 9]);
   });
   it("splits a truncated page range and does not save its partial response", async () => {
     const transport = vi.fn(async (request) => {

@@ -7,8 +7,26 @@ import { AIProcessingError, providerError, type ExtractionProvider, type OCRDocu
 export { flattenEvidence, procurementExtractionSchema, type EvidenceField, type ProcurementExtraction } from "./extraction-schema";
 export const DEFAULT_EXTRACTION_MODEL = "mistral-large-latest";
 export const DEFAULT_EXTRACTION_MAX_TOKENS = 65_536;
+export const DEFAULT_EXTRACTION_CONCURRENCY = 4;
 const MAX_BATCH_PAGES = 4;
 const MAX_BATCH_CHARACTERS = 60_000;
+
+/** Runs page ranges concurrently in input order; the first failure aborts the remaining provider calls. */
+async function mapConcurrently<T, R>(items: T[], limit: number, signal: AbortSignal | undefined, run: (item: T, signal: AbortSignal) => Promise<R>): Promise<R[]> {
+  const controller = new AbortController();
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const lane = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await run(items[index]!, combined);
+    }
+  };
+  try { await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane)); }
+  catch (error) { controller.abort(); throw error; }
+  return results;
+}
 
 export interface ExtractionResult {
   documentId: string;
@@ -146,13 +164,18 @@ export class MistralProcurementExtractor implements ExtractionProvider<Extractio
   private readonly apiKey?: string;
   private readonly transport?: ExtractionTransport;
   private readonly maxTokens: number;
+  private readonly concurrency: number;
 
-  constructor(options: { model?: string; apiKey?: string; transport?: ExtractionTransport; maxTokens?: number } = {}) {
+  constructor(options: { model?: string; apiKey?: string; transport?: ExtractionTransport; maxTokens?: number; concurrency?: number } = {}) {
     this.model = options.model ?? process.env.MISTRAL_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
     this.apiKey = options.apiKey ?? process.env.MISTRAL_API_KEY;
     this.transport = options.transport;
     this.maxTokens = z.number().int().min(1024).max(65_536).parse(
       options.maxTokens ?? Number(process.env.MISTRAL_EXTRACTION_MAX_TOKENS || DEFAULT_EXTRACTION_MAX_TOKENS),
+    );
+    // Bounded by the Mistral workspace rate limit; 1 restores sequential page ranges.
+    this.concurrency = z.number().int().min(1).max(8).parse(
+      options.concurrency ?? Number(process.env.MISTRAL_EXTRACTION_CONCURRENCY || DEFAULT_EXTRACTION_CONCURRENCY),
     );
   }
 
@@ -176,11 +199,8 @@ export class MistralProcurementExtractor implements ExtractionProvider<Extractio
       batchCharacters += page.markdown.length;
     }
     if (batch.length) batches.push(batch);
-    const results: ModelExtraction[] = [];
-    for (const pages of batches) {
-      results.push(...await this.extractPageRange(pages, options));
-    }
-    const { merged, issues } = mergePageExtractions(results);
+    const ranges = await mapConcurrently(batches, this.concurrency, options.signal, (pages, signal) => this.extractPageRange(pages, { signal }));
+    const { merged, issues } = mergePageExtractions(ranges.flat());
     const validated = validateExtraction(merged, document);
     return { ...validated, model: this.model, issues: [...validated.issues, ...issues] };
   }
@@ -218,9 +238,8 @@ export class MistralProcurementExtractor implements ExtractionProvider<Extractio
     } catch (error) {
       if (error instanceof AIProcessingError && error.code === "EXTRACTION_DOCUMENT_TOO_LONG" && pages.length > 1) {
         const midpoint = Math.ceil(pages.length / 2);
-        const first = await this.extractPageRange(pages.slice(0, midpoint), options);
-        const second = await this.extractPageRange(pages.slice(midpoint), options);
-        return [...first, ...second];
+        const halves = await mapConcurrently([pages.slice(0, midpoint), pages.slice(midpoint)], 2, options.signal, (half, signal) => this.extractPageRange(half, { signal }));
+        return halves.flat();
       }
       throw providerError(error, "EXTRACTION");
     }
