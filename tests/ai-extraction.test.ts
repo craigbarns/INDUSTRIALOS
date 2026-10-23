@@ -68,9 +68,38 @@ describe("Industrial extraction validation and source evidence", () => {
 
   it("flags ambiguous decimal convention and hallucinated numeric values", () => {
     const raw = emptyModelExtraction();
-    raw.products = [product({ unitPrice: field("0.85", "USD 0,85 per piece"), priceBasis: field("piece") }), product({ unitPrice: field("5.99", "USD 1.20 per piece"), priceBasis: field("piece") })];
-    const result = validateExtraction(raw, ocr("USD 0,85 per piece\nUSD 1.20 per piece"));
+    raw.products = [product({ unitPrice: field("1.25", "USD 1,250 per piece"), priceBasis: field("piece") }), product({ unitPrice: field("1250", "USD 1,250 per piece"), priceBasis: field("piece") }), product({ unitPrice: field("5.99", "USD 1,250 per piece"), priceBasis: field("piece") })];
+    const result = validateExtraction(raw, ocr("USD 1,250 per piece"));
     expect(result.data.products.every((item) => item.unitPrice.status === "ambiguous")).toBe(true);
+  });
+
+  it("reads a three-digit group using the document's own decimal convention", () => {
+    const priced = (value: string, quote: string) => product({ unitPrice: field(value, quote), priceBasis: field("piece") });
+    const french = emptyModelExtraction();
+    french.products = [priced("1.25", "Prix 1,250 per piece"), priced("1250", "Prix 1,250 per piece")];
+    expect(validateExtraction(french, ocr("Prix 1,250 per piece\nRemise 4,00")).data.products.map((item) => item.unitPrice.status)).toEqual(["extracted", "ambiguous"]);
+    const english = emptyModelExtraction();
+    english.products = [priced("1.25", "Price 1,250 per piece"), priced("1250", "Price 1,250 per piece")];
+    expect(validateExtraction(english, ocr("Price 1,250 per piece\nDiscount 0.85")).data.products.map((item) => item.unitPrice.status)).toEqual(["ambiguous", "extracted"]);
+    const mixed = emptyModelExtraction();
+    mixed.products = [priced("1250", "Price 1,250 per piece")];
+    expect(validateExtraction(mixed, ocr("Price 1,250 per piece\n4,00 and 0.85")).data.products[0]!.unitPrice.status).toBe("ambiguous");
+  });
+
+  it("accepts unambiguous European decimals and euro notation", () => {
+    const raw = emptyModelExtraction();
+    raw.quotation.currency = field("EUR", "Montants en Euros");
+    raw.pricing.totalAmount = field("1319.05", "Total € HT 1 319,05");
+    raw.products = [
+      product({ unitPrice: field("4.00", "PRIX H-T 4,00"), priceBasis: field("U"), currency: field("EUR", "4,00 €") }),
+      product({ unitPrice: field("2310.50", "2.310,50 EUR"), priceBasis: field("U") }),
+      product({ unitPrice: field("319.05", "Total € HT 1 319,05"), priceBasis: field("U") }),
+    ];
+    const result = validateExtraction(raw, ocr("Montants en Euros\nTotal € HT 1 319,05\nPRIX H-T 4,00\n4,00 €\n2.310,50 EUR"));
+    expect(result.data.quotation.currency.status).toBe("extracted");
+    expect(result.data.pricing.totalAmount.status).toBe("extracted");
+    expect(result.data.products.map((item) => item.unitPrice.status)).toEqual(["extracted", "extracted", "ambiguous"]);
+    expect(result.data.products[0]!.currency.status).toBe("extracted");
   });
 
   it("flags price, MOQ and weight when their bases are absent", () => {

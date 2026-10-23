@@ -66,13 +66,41 @@ function canonicalDecimal(value: string) {
   return `${whole!.replace(/^0+(?=\d)/, "")}${tail ? `.${tail}` : ""}`;
 }
 
-function decimalAppearsInQuote(value: string, quote: string) {
-  const tokens = quote.match(/\d+(?:[.,]\d+)*/g) ?? [];
+type DecimalConvention = "dot" | "comma" | "unknown";
+
+/** A document's decimal separator, inferred only from numbers that cannot be thousands groups ("4,00", "0.85"). */
+function decimalConvention(text: string): DecimalConvention {
+  const comma = /\d,(?:\d{1,2}|\d{4,})(?!\d)/.test(text);
+  const dot = /\d\.(?:\d{1,2}|\d{4,})(?!\d)/.test(text);
+  return comma === dot ? "unknown" : comma ? "comma" : "dot";
+}
+
+/** Normalized whitespace leaves single spaces, which group thousands in European formats: "1 319,05". */
+function decimalAppearsInQuote(value: string, quote: string, convention: DecimalConvention) {
+  const tokens = quote.match(/\d{1,3}(?: \d{3})+(?:,\d+)?|\d+(?:[.,]\d+)*/g) ?? [];
   return tokens.some((token) => {
-    // Only explicit dot-decimal or unambiguous comma-grouped numbers are accepted.
-    if (token.includes(",") && !/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(token)) return false;
-    return canonicalDecimal(token.replaceAll(",", "")) === canonicalDecimal(value);
+    const compact = token.replaceAll(" ", "");
+    let normalized: string;
+    if (token !== compact) normalized = compact.replace(",", "."); // 1 319,05
+    else if (/^\d{1,3}(,\d{3}){2,}(\.\d+)?$|^\d{1,3}(,\d{3})+\.\d+$/.test(compact)) normalized = compact.replaceAll(",", ""); // 1,234,567 / 1,234.56
+    else if (/^\d{1,3}(\.\d{3}){2,}(,\d+)?$|^\d{1,3}(\.\d{3})+,\d+$/.test(compact)) normalized = compact.replaceAll(".", "").replace(",", "."); // 1.234.567 / 1.234,56
+    // A single separator followed by exactly three digits ("1,250", "1.250") depends on the document's convention.
+    else if (/^\d{1,3}[.,]\d{3}$/.test(compact)) {
+      if (convention === "unknown") return false;
+      const separator = compact.includes(",") ? "comma" : "dot";
+      normalized = separator === convention ? compact.replace(",", ".") : compact.replace(/[.,]/, "");
+    }
+    else if (/^\d+,\d+$/.test(compact)) normalized = compact.replace(",", "."); // 4,00
+    else if (/^\d+(\.\d+)?$/.test(compact)) normalized = compact;
+    else return false;
+    return canonicalDecimal(normalized) === canonicalDecimal(value);
   });
+}
+
+/** A currency is explicit when its ISO code appears, or for EUR an unambiguous euro sign or name. */
+function currencyAppearsInQuote(code: string, quote: string) {
+  if (quote.includes(code)) return true;
+  return code === "EUR" && /€|\beuros?\b/i.test(quote);
 }
 
 /** Grounding verifies quote presence, not factual correctness; human approval remains explicit. */
@@ -80,6 +108,7 @@ export function validateExtraction(raw: unknown, document: OCRDocument): Extract
   const parsed = modelExtractionSchema.safeParse(raw);
   if (!parsed.success) throw new AIProcessingError("EXTRACTION_INVALID_RESPONSE", "The extraction provider returned data that does not match the procurement schema.", true);
   const pageMap = new Map(document.pages.map((page) => [page.pageNumber, normalizeWhitespace(page.markdown)]));
+  const convention = decimalConvention([...pageMap.values()].join("\n"));
   const issues: string[] = [];
   function transform(value: unknown, path: string): unknown {
     if (value !== null && typeof value === "object" && "status" in value && "originalText" in value) {
@@ -104,9 +133,9 @@ export function validateExtraction(raw: unknown, document: OCRDocument): Extract
       if (!quote || !page || !page.includes(quote)) flag("source quote does not match the cited OCR page");
       if (decimalKeys.has(key)) {
         if (!isDecimalString(field.value)) flag("amount or quantity requires an unambiguous decimal string");
-        else if (!quote || !decimalAppearsInQuote(field.value, quote)) flag("number is absent or ambiguous in the source quote");
+        else if (!quote || !decimalAppearsInQuote(field.value, quote, convention)) flag("number is absent or ambiguous in the source quote");
       }
-      if (key === "currency" && (!/^[A-Z]{3}$/.test(field.value) || !quote?.includes(field.value))) {
+      if (key === "currency" && (!/^[A-Z]{3}$/.test(field.value) || !quote || !currencyAppearsInQuote(field.value, quote))) {
         flag("currency requires an explicit code in the source; confirm any interpretation");
       }
       return field;
