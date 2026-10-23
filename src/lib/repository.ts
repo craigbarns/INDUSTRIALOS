@@ -12,6 +12,7 @@ export const createProjectSchema = z.object({ name: z.string().trim().min(1).max
 export const updateProjectSchema = createProjectSchema.partial().extend({ status: z.enum(["active", "completed", "archived"]).optional() }).refine(v => Object.keys(v).length > 0);
 export const correctionRequestSchema = z.object({ version: z.number().int().positive(), corrections: correctionsSchema }).strict();
 export const approvalRequestSchema = z.object({ version: z.number().int().positive() }).strict();
+export const moveDocumentSchema = z.object({ projectId: z.uuid().nullable() }).strict();
 
 // Every application query is scoped with the server-validated context, never request organizationId.
 const documentColumns = getTableColumns(documents);
@@ -55,6 +56,23 @@ export async function getDocumentReference(ctx: TenantContext, id: string, db: D
   const [document] = await db.select().from(documents).where(and(eq(documents.id, id), eq(documents.organizationId, ctx.organizationId))).limit(1);
   if (!document) throw new AppError(404, "NOT_FOUND", "Document not found.");
   return document;
+}
+/** Same rule as choosing a project at upload: any member, within the organization, never into an archived project. */
+export async function moveDocument(ctx: TenantContext, id: string, input: z.infer<typeof moveDocumentSchema>, db: Database = getDb()) {
+  const { projectId } = moveDocumentSchema.parse(input);
+  await db.transaction(async tx => {
+    const [document] = await tx.select({ projectId: documents.projectId }).from(documents).where(and(eq(documents.id, id), eq(documents.organizationId, ctx.organizationId))).for("update");
+    if (!document) throw new AppError(404, "NOT_FOUND", "Document not found.");
+    if (projectId) {
+      const [project] = await tx.select({ status: procurementProjects.status }).from(procurementProjects).where(and(eq(procurementProjects.id, projectId), eq(procurementProjects.organizationId, ctx.organizationId))).for("update");
+      if (!project) throw new AppError(404, "NOT_FOUND", "Project not found.");
+      if (project.status === "archived") throw new AppError(409, "PROJECT_ARCHIVED", "Documents cannot be added to an archived project.");
+    }
+    if (document.projectId === projectId) return;
+    await tx.update(documents).set({ projectId, updatedAt: new Date() }).where(and(eq(documents.id, id), eq(documents.organizationId, ctx.organizationId)));
+    await tx.insert(auditLogs).values({ organizationId: ctx.organizationId, userId: ctx.userId, documentId: id, action: "document.moved", details: { fromProjectId: document.projectId, toProjectId: projectId } });
+  });
+  return getDocument(ctx, id, db);
 }
 export async function deleteDocument(ctx: TenantContext, id: string, db: Database = getDb()) {
   const document = await getDocumentReference(ctx, id, db);

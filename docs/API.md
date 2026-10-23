@@ -16,6 +16,7 @@ Successful JSON responses use `{ "data": ... }`. Errors use `{ "error": { "code"
 | `POST /api/documents/upload` | Multipart: one `file`, optional `projectId` | Stored document metadata, 201 |
 | `GET /api/documents` | — | Current organization's document metadata |
 | `GET /api/documents/:id` | — | Document metadata, without object storage key |
+| `PATCH /api/documents/:id` | `{projectId: uuid \| null}` | Document metadata. Any member may move a document into a project of the same organization, between projects, or out (`null`). Archived projects return 409 `PROJECT_ARCHIVED`; each actual move adds a `document.moved` audit record |
 | `DELETE /api/documents/:id` | — | `{id}`. Uploader or owner/admin only (403 otherwise). Removes the private file first, then the document, pages, analysis and jobs; adds a `document.deleted` audit record. Storage failure returns 503 and leaves the document in place so the request can be retried |
 | `GET /api/documents/:id/content` | — | Authorized file bytes; private/no-store/nosniff |
 | `POST /api/documents/:id/analyze` | `{}` | `{jobId, documentId, status, duplicate}`, 202 |

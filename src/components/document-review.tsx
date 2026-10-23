@@ -25,6 +25,7 @@ import {
   message,
   useResource,
   type ProcurementDocument,
+  type Project,
 } from "@/lib/client";
 import { formatDate } from "@/lib/i18n";
 import {
@@ -130,6 +131,7 @@ export function DocumentReview({ id }: { id: string }) {
   const [approveOpen, setApproveOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteError, setDeleteError] = useState("");
+  const projects = useResource<Project[]>("/api/projects");
   const { workspace } = useWorkspace();
   const router = useRouter();
   const doc = document.data;
@@ -216,6 +218,25 @@ export function DocumentReview({ id }: { id: string }) {
       setBusy(null);
     }
   }
+  async function move(projectId: string | null) {
+    setBusy("move");
+    setActionError("");
+    setSuccess("");
+    try {
+      const moved = await api<ProcurementDocument>(`/api/documents/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ projectId }),
+      });
+      if (moved) document.setData(moved);
+      else document.refresh();
+      const name = projects.data?.find((p) => p.id === projectId)?.name;
+      setSuccess(name ? `Document moved to ${name}.` : "Document removed from its project.");
+    } catch (error) {
+      setActionError(message(error));
+    } finally {
+      setBusy(null);
+    }
+  }
   async function remove() {
     if (!doc) return;
     setBusy("delete");
@@ -287,6 +308,22 @@ export function DocumentReview({ id }: { id: string }) {
                 status={doc.status}
                 approved={Boolean(doc.approvedAt ?? result?.approvedAt)}
               />
+              <select
+                className="select"
+                aria-label="Procurement project"
+                value={doc.projectId ?? ""}
+                onChange={(event) => void move(event.target.value || null)}
+                disabled={busy !== null || projects.loading}
+              >
+                <option value="">No project</option>
+                {projects.data
+                  ?.filter((p) => p.status !== "archived" || p.id === doc.projectId)
+                  .map((p) => (
+                    <option value={p.id} key={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+              </select>
               <a
                 className="button button-secondary"
                 href={`/api/documents/${id}/content`}
