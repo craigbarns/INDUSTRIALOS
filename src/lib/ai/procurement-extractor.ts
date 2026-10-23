@@ -108,6 +108,9 @@ export function validateExtraction(raw: unknown, document: OCRDocument): Extract
   const parsed = modelExtractionSchema.safeParse(raw);
   if (!parsed.success) throw new AIProcessingError("EXTRACTION_INVALID_RESPONSE", "The extraction provider returned data that does not match the procurement schema.", true);
   const pageMap = new Map(document.pages.map((page) => [page.pageNumber, normalizeWhitespace(page.markdown)]));
+  // OCR renders tables as "| 48 | ML |"; a quote spanning cells is still verbatim once separators are ignored.
+  const cellText = (text: string) => normalizeWhitespace(text.replaceAll("|", " "));
+  const pageCells = new Map([...pageMap].map(([pageNumber, text]) => [pageNumber, cellText(text)]));
   const convention = decimalConvention([...pageMap.values()].join("\n"));
   const issues: string[] = [];
   function transform(value: unknown, path: string): unknown {
@@ -130,7 +133,8 @@ export function validateExtraction(raw: unknown, document: OCRDocument): Extract
       if (field.status === "missing") flag("a missing field cannot have a value");
       const quote = field.originalText && normalizeWhitespace(field.originalText);
       const page = field.pageNumber === null ? undefined : pageMap.get(field.pageNumber);
-      if (!quote || !page || !page.includes(quote)) flag("source quote does not match the cited OCR page");
+      const verbatim = Boolean(quote && page && (page.includes(quote) || pageCells.get(field.pageNumber!)!.includes(cellText(quote))));
+      if (!verbatim) flag("source quote does not match the cited OCR page");
       if (decimalKeys.has(key)) {
         if (!isDecimalString(field.value)) flag("amount or quantity requires an unambiguous decimal string");
         else if (!quote || !decimalAppearsInQuote(field.value, quote, convention)) flag("number is absent or ambiguous in the source quote");
@@ -145,6 +149,25 @@ export function validateExtraction(raw: unknown, document: OCRDocument): Extract
     return value;
   }
   const data = procurementExtractionSchema.parse(transform(parsed.data, ""));
+  // A row price rarely repeats the currency. When the whole document states exactly one currency,
+  // product rows that claim that same currency cite the document-level evidence instead.
+  const rowCurrencies = data.products.flatMap((product) => [product.currency, ...product.priceBreaks.map((tier) => tier.currency)]);
+  const statedCurrencies = new Set([data.quotation.currency, data.pricing.currency, ...rowCurrencies].filter((item) => item.status === "extracted" && item.value !== null).map((item) => item.value));
+  const documentCurrency = [data.quotation.currency, data.pricing.currency].find((item) => item.status === "extracted" && item.value !== null);
+  const inherited = new Set<string>();
+  if (documentCurrency && statedCurrencies.size === 1) {
+    data.products.forEach((product, index) => {
+      const rows: Array<[{ currency: EvidenceField }, string]> = [[product, `products.${index}.currency`], ...product.priceBreaks.map((tier, tierIndex): [{ currency: EvidenceField }, string] => [tier, `products.${index}.priceBreaks.${tierIndex}.currency`])];
+      for (const [row, path] of rows) {
+        if (row.currency.status === "ambiguous" && row.currency.value === documentCurrency.value) {
+          row.currency = structuredClone(documentCurrency);
+          inherited.add(path);
+        }
+      }
+    });
+  }
+  const remainingIssues = issues.filter((issue) => !inherited.has(issue.slice(0, issue.indexOf(": "))));
+  issues.splice(0, issues.length, ...remainingIssues);
   for (const [index, product] of data.products.entries()) {
     const flagBasis = (amount: EvidenceField, basis: EvidenceField, path: string, reason: string) => {
       if (amount.value !== null && (basis.value === null || basis.status !== "extracted")) {

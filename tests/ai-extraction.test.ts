@@ -73,6 +73,29 @@ describe("Industrial extraction validation and source evidence", () => {
     expect(result.data.products.every((item) => item.unitPrice.status === "ambiguous")).toBe(true);
   });
 
+  it("matches quotes that span OCR table cells", () => {
+    const raw = emptyModelExtraction();
+    raw.products = [product({ minimumOrderQuantity: field("48", "48 ML"), quantityUnit: field("ML", "48 ML") })];
+    const result = validateExtraction(raw, ocr("| CODE | QUANTITE | Un |\n| 218025-01 | 48 | ML |"));
+    expect(result.data.products[0]!.minimumOrderQuantity.status).toBe("extracted");
+    expect(result.data.products[0]!.quantityUnit.status).toBe("extracted");
+  });
+
+  it("lets product rows inherit the single currency stated by the document, and nothing else", () => {
+    const text = "Montants en Euros\n| PRIX H-T | 8,25 |";
+    const single = emptyModelExtraction();
+    single.quotation.currency = field("EUR", "Montants en Euros");
+    single.products = [product({ currency: field("EUR", "PRIX H-T | 8,25") }), product({ currency: field("USD", "PRIX H-T | 8,25") })];
+    const result = validateExtraction(single, ocr(text));
+    expect(result.data.products[0]!.currency).toMatchObject({ value: "EUR", status: "extracted", originalText: "Montants en Euros" });
+    expect(result.issues.some((issue) => issue.startsWith("products.0.currency:"))).toBe(false);
+    expect(result.data.products[1]!.currency.status).toBe("ambiguous");
+    const mixed = emptyModelExtraction();
+    mixed.quotation.currency = field("EUR", "Montants en Euros");
+    mixed.products = [product({ currency: field("EUR", "PRIX H-T | 8,25") }), product({ currency: field("GBP", "GBP 3.00") })];
+    expect(validateExtraction(mixed, ocr(`${text}\nGBP 3.00`)).data.products[0]!.currency.status).toBe("ambiguous");
+  });
+
   it("reads a three-digit group using the document's own decimal convention", () => {
     const priced = (value: string, quote: string) => product({ unitPrice: field(value, quote), priceBasis: field("piece") });
     const french = emptyModelExtraction();
