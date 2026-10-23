@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { inflateSync } from "node:zlib";
 
 export const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
 export const SUPPORTED_MIME_TYPES = ["application/pdf", "image/png", "image/jpeg"] as const;
@@ -18,6 +19,41 @@ export interface ValidatedUpload {
   extension: "pdf" | "png" | "jpg" | "jpeg";
   size: number;
   sha256: string;
+}
+
+const MAX_INFLATED_PDF_BYTES = 64 * 1024 * 1024;
+
+/**
+ * PDF syntax with stream data replaced by its decompressed form, so compressed bytes cannot
+ * match by chance and object streams cannot hide dictionaries. Name escapes (#xx) are decoded.
+ */
+function pdfSyntax(buffer: Buffer): string {
+  const source = buffer.toString("latin1");
+  const parts: string[] = [];
+  let inflatedBytes = 0;
+  let position = 0;
+  const streamStart = /stream\r?\n/g;
+  for (let match = streamStart.exec(source); match; match = streamStart.exec(source)) {
+    if (match.index > 0 && /[A-Za-z]/.test(source[match.index - 1])) continue; // "endstream"
+    const dataStart = match.index + match[0].length;
+    const dataEnd = source.indexOf("endstream", dataStart);
+    if (dataEnd < 0) break;
+    const dictionary = source.slice(source.lastIndexOf("obj", match.index), match.index);
+    parts.push(source.slice(position, dataStart));
+    try {
+      const inflated = inflateSync(buffer.subarray(dataStart, dataEnd), { maxOutputLength: Math.max(1, MAX_INFLATED_PDF_BYTES - inflatedBytes) });
+      inflatedBytes += inflated.length;
+      parts.push(inflated.toString("latin1"));
+    } catch (error) {
+      if (error instanceof RangeError) throw new UploadValidationError("UNSAFE_DOCUMENT", "This PDF expands to too much data to be checked safely.");
+      // Images and other non-Flate data are not PDF syntax, but object streams must be readable.
+      if (/\/Type\s*\/ObjStm/.test(dictionary)) throw new UploadValidationError("UNSAFE_DOCUMENT", "This PDF uses an unsupported internal encoding. Export a flattened PDF.");
+    }
+    position = dataEnd;
+    streamStart.lastIndex = dataEnd + "endstream".length;
+  }
+  parts.push(source.slice(position));
+  return parts.join("").replace(/#([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
 }
 
 /** Validation runs on the server against the actual bytes, never client metadata alone. */
@@ -60,9 +96,13 @@ export function validateUpload(file: UploadMetadata, bytes: Uint8Array): Validat
       throw new UploadValidationError("INVALID_FILE_SIGNATURE", "This PDF is incomplete or damaged.");
     }
     // Active documents and encrypted files are outside the passive-document scope of Sprint 1.
-    const decodedNames = text.replace(/#([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-    if (/\/(?:JavaScript|JS|Launch|EmbeddedFiles?|RichMedia|XFA|Encrypt|OpenAction|AA)\b/i.test(decodedNames)) {
-      throw new UploadValidationError("UNSAFE_DOCUMENT", "Active, embedded, or encrypted PDF content is not supported. Export a flattened PDF.");
+    const syntax = pdfSyntax(buffer);
+    if (/\/Encrypt(?![A-Za-z0-9])/.test(syntax)) {
+      throw new UploadValidationError("ENCRYPTED_DOCUMENT", "Encrypted or password-protected PDFs are not supported. Print or export the document to a new PDF without protection.");
+    }
+    // Names are case-sensitive in PDF. /OpenAction and /AA only trigger actions; the dangerous action types are matched by name.
+    if (/\/(?:JavaScript|JS|Launch|EmbeddedFiles?|RichMedia|XFA)(?![A-Za-z0-9])/.test(syntax)) {
+      throw new UploadValidationError("UNSAFE_DOCUMENT", "Active or embedded PDF content is not supported. Export a flattened PDF.");
     }
   }
   if (mimeType === "image/png" && (buffer.length < 20 || buffer.subarray(-8, -4).toString("ascii") !== "IEND")) {

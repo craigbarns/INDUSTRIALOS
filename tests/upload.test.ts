@@ -1,3 +1,4 @@
+import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { MAX_DOCUMENT_BYTES, validateUpload } from "../src/lib/upload-validation";
 
@@ -14,6 +15,25 @@ describe("secure document upload validation", () => {
   it("rejects a disguised executable", () => { const bytes = Buffer.from("MZ-this-is-not-a-pdf"); expect(() => validateUpload({ ...metadata, size: bytes.length }, bytes)).toThrow("contents do not match"); });
   it("rejects paths and null bytes in names", () => { for (const name of ["../quote.pdf", "folder\\quote.pdf", "quote\0.pdf"]) expect(() => validateUpload({ ...metadata, name }, pdf)).toThrow("filename"); });
   it("rejects embedded active PDF content", () => { const bytes = Buffer.from("%PDF-1.7\n<< /OpenAction << /JS (malicious) >> >>\n%%EOF"); expect(() => validateUpload({ ...metadata, size: bytes.length }, bytes)).toThrow("flattened PDF"); });
+  it("accepts compressed data and open actions found in ordinary exported PDFs", () => {
+    const noise = Buffer.from("q /aa 1 Tf /js 2 Tf /Encrypted Q");
+    const bytes = Buffer.concat([Buffer.from("%PDF-1.7\n1 0 obj << /Type /Catalog /OpenAction [2 0 R /Fit] >> endobj\n2 0 obj << /Length 9 >> stream\n"), Buffer.from([0x78, 0x9c, 0x2f, 0x61, 0x61, 0x20, 0x2f, 0x4a, 0x53]), Buffer.from("\nendstream endobj\n3 0 obj << /Filter /FlateDecode >> stream\n"), deflateSync(noise), Buffer.from("\nendstream endobj\n%%EOF\n")]);
+    expect(validateUpload({ ...metadata, size: bytes.length }, bytes).mimeType).toBe("application/pdf");
+  });
+  it("rejects JavaScript hidden in a compressed object stream", () => {
+    const bytes = Buffer.concat([Buffer.from("%PDF-1.7\n1 0 obj << /Type /ObjStm /Filter /FlateDecode >> stream\n"), deflateSync(Buffer.from("<< /S /JavaScript /J#53 (app.alert(1)) >>")), Buffer.from("\nendstream endobj\n%%EOF\n")]);
+    expect(() => validateUpload({ ...metadata, size: bytes.length }, bytes)).toThrow("flattened PDF");
+  });
+  it("rejects object streams it cannot read and oversized decompression", () => {
+    const opaque = Buffer.from("%PDF-1.7\n1 0 obj << /Type /ObjStm /Filter /LZWDecode >> stream\nabc\nendstream endobj\n%%EOF\n");
+    expect(() => validateUpload({ ...metadata, size: opaque.length }, opaque)).toThrow("internal encoding");
+    const bomb = Buffer.concat([Buffer.from("%PDF-1.7\n1 0 obj << /Filter /FlateDecode >> stream\n"), deflateSync(Buffer.alloc(65 * 1024 * 1024)), Buffer.from("\nendstream endobj\n%%EOF\n")]);
+    expect(() => validateUpload({ ...metadata, size: bomb.length }, bomb)).toThrow("too much data");
+  });
+  it("explains that encrypted PDFs must be re-exported", () => {
+    const bytes = Buffer.from("%PDF-1.7\ntrailer << /Root 1 0 R /Encrypt 5 0 R >>\n%%EOF\n");
+    expect(() => validateUpload({ ...metadata, size: bytes.length }, bytes)).toThrow("password-protected");
+  });
   it("rejects truncated PDFs and PNGs", () => {
     expect(() => validateUpload({ ...metadata, size: 9 }, Buffer.from("%PDF-1.7\n"))).toThrow("incomplete");
     const bytes = Buffer.from([137,80,78,71,13,10,26,10]);
