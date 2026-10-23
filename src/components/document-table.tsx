@@ -1,21 +1,30 @@
 "use client";
 import Link from "next/link";
 import { ChevronRight } from "lucide-react";
-import { type ProcurementDocument } from "@/lib/client";
+import { type ProcurementDocument, type Project } from "@/lib/client";
 import { formatDate } from "@/lib/i18n";
 import { FileIcon, Status, formatBytes } from "@/components/ui";
 
 export function DocumentTable({
   documents,
+  projects,
+  onMove,
+  movingId,
 }: {
   documents: ProcurementDocument[];
+  /** With onMove, each row gets a project picker for filing documents from the list. */
+  projects?: Project[];
+  onMove?: (document: ProcurementDocument, projectId: string | null) => void;
+  movingId?: string | null;
 }) {
+  const filing = Boolean(projects && onMove);
   return (
     <div className="table-wrap">
       <table className="data-table">
         <thead>
           <tr>
             <th scope="col">Document name</th>
+            {filing && <th scope="col">Project</th>}
             <th scope="col">Status</th>
             <th scope="col">Uploaded</th>
             <th scope="col">Size</th>
@@ -40,6 +49,32 @@ export function DocumentTable({
                   </div>
                 </Link>
               </td>
+              {filing && (
+                <td>
+                  <select
+                    className="select select-compact"
+                    aria-label={`Project for ${document.fileName}`}
+                    value={document.projectId ?? ""}
+                    onChange={(event) =>
+                      onMove!(document, event.target.value || null)
+                    }
+                    disabled={movingId === document.id}
+                  >
+                    <option value="">No project</option>
+                    {projects!
+                      .filter(
+                        (p) =>
+                          p.status !== "archived" ||
+                          p.id === document.projectId,
+                      )
+                      .map((p) => (
+                        <option value={p.id} key={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                  </select>
+                </td>
+              )}
               <td>
                 <Status
                   status={document.status}

@@ -309,7 +309,7 @@ export function DocumentReview({ id }: { id: string }) {
                 approved={Boolean(doc.approvedAt ?? result?.approvedAt)}
               />
               <select
-                className="select"
+                className="select select-compact"
                 aria-label="Procurement project"
                 value={doc.projectId ?? ""}
                 onChange={(event) => void move(event.target.value || null)}

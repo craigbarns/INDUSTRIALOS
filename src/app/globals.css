@@ -535,6 +535,14 @@ p {
   padding: 7px 30px 7px 10px;
   margin-left: auto;
 }
+/* Project pickers inside page headers and table rows. */
+.select.select-compact {
+  width: auto;
+  max-width: 220px;
+  min-height: 34px;
+  font-size: 12px;
+  padding: 6px 28px 6px 10px;
+}
 .toolbar-count {
   font-size: 11px;
   color: var(--muted);
